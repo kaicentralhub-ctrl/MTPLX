@@ -108,6 +108,95 @@ from mtplx.backends.registry import load_runtime_contract
 from mtplx.batching import BatchSchedulerConfig, SchedulerMode, SchedulerPreset
 from mtplx.chat_encode_cache import GLOBAL_CHAT_ENCODE_CACHE, ChatEncodeCache
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
+# ENI: Native memory-augmented generation
+try:
+    from mtplx.eni import enrich_messages_for_generation as _eni_enrich, is_enabled as _eni_enabled, get_current_injection_hash as _eni_hash
+    _ENI_AVAILABLE = True
+except ImportError:
+    _ENI_AVAILABLE = False
+    def _eni_enrich(messages, session_id=None): return messages
+    def _eni_enabled(): return False
+    def _eni_hash(): return "empty"
+
+try:
+    from mtplx.eni.kv_cache import maybe_inject_kv as _eni_maybe_inject_kv, capture_kv_async as _eni_capture_kv_async
+    _ENI_KV_AVAILABLE = True
+except ImportError:
+    _ENI_KV_AVAILABLE = False
+    def _eni_maybe_inject_kv(*a, **kw): return False
+    def _eni_capture_kv_async(*a, **kw): pass
+
+try:
+    from mtplx.eni.adaptive_sampling import (
+        get_recommended_draft_temp as _eni_as_get_recommended,
+        record_accept_rate_async as _eni_as_record,
+        extract_accept_rate_from_generated as _eni_as_extract_rate,
+    )
+    _ENI_AS_AVAILABLE = True
+except ImportError:
+    _ENI_AS_AVAILABLE = False
+    def _eni_as_get_recommended(*a, **kw): return None
+    def _eni_as_record(*a, **kw): pass
+    def _eni_as_extract_rate(*a, **kw): return None
+
+try:
+    from mtplx.eni.sdpa_mem_fused import (
+        register_mem_kv_for_request as _eni_mf_register,
+        clear_mem_kv_registry as _eni_mf_clear,
+        get_mem_fused_stats as _eni_mf_stats,
+    )
+    from mtplx.eni.kernel_integration import (
+        prepare_memory_for_kernel as _eni_prepare_mem_kernel,
+        get_integration_stats as _eni_integration_stats,
+    )
+    _ENI_MF_AVAILABLE = True
+except ImportError:
+    _ENI_MF_AVAILABLE = False
+    def _eni_mf_register(*a, **kw): pass
+    def _eni_mf_clear(*a, **kw): pass
+    def _eni_mf_stats(*a, **kw): return {}
+    def _eni_prepare_mem_kernel(*a, **kw): return False
+    def _eni_integration_stats(*a, **kw): return {}
+
+
+class _ENIKVCaptureBankProxy:
+    """Thin proxy around SessionBank that fires ENI KV capture on put().
+
+    Wraps session_bank_for_generation for exactly one request lifetime.
+    All attributes and methods delegate transparently to the real bank.
+    Only put() is intercepted: on the first call (the prompt-boundary
+    snapshot), we fire capture_kv_async on a background thread so the
+    KV for this ENI injection hash is available to future requests.
+    """
+
+    __slots__ = ("_bank", "_eni_hash", "_rt", "_captured")
+
+    def __init__(self, bank: object, eni_hash: str, runtime: object) -> None:
+        object.__setattr__(self, "_bank", bank)
+        object.__setattr__(self, "_eni_hash", eni_hash)
+        object.__setattr__(self, "_rt", runtime)
+        object.__setattr__(self, "_captured", False)
+
+    def put(self, *, runtime, token_ids, cache, logits, **kwargs):
+        result = object.__getattribute__(self, "_bank").put(
+            runtime=runtime, token_ids=token_ids, cache=cache, logits=logits, **kwargs
+        )
+        if not object.__getattribute__(self, "_captured") and _ENI_KV_AVAILABLE:
+            object.__setattr__(self, "_captured", True)
+            _eni_capture_kv_async(
+                cache,
+                logits,
+                token_ids,
+                object.__getattribute__(self, "_eni_hash"),
+                runtime,
+            )
+        return result
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_bank"), name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        setattr(object.__getattribute__(self, "_bank"), name, value)
 from mtplx.constrained import (
     ResponseFormatError,
     constraint_spec_from_response_format,
@@ -25834,6 +25923,19 @@ def _run_generation(
             request_observability=request_observability,
         )
     )
+    # ENI Phase B (T7): Content-aware draft temperature pre-warm.
+    # Inserts above all 5 policy levels in _resolve_draft_sampler_for_request()
+    # using cross-request EMA of pos-1 accept rate keyed by injection_hash.
+    # Eliminates adaptive_dtemp's cold-start seed phase for known content types.
+    if _ENI_AS_AVAILABLE and _ENI_AVAILABLE and _eni_enabled() and effective_draft_sampler is not None:
+        _eni_rec_temp = _eni_as_get_recommended(
+            _eni_hash(),
+            float(getattr(effective_draft_sampler, "temperature", 0.0)),
+        )
+        if _eni_rec_temp is not None:
+            effective_draft_sampler = replace(effective_draft_sampler, temperature=float(_eni_rec_temp))
+            if request_observability is not None:
+                request_observability["eni_draft_temp_recommended"] = float(_eni_rec_temp)
     requested_depth = (
         0
         if effective_mode == "ar"
@@ -32453,6 +32555,13 @@ def create_app(state: ServerState) -> FastAPI:
                     detail="image content requires MTP generation mode",
                 )
         template_observability: dict[str, Any] = {}
+        # ENI: Inject memories into messages before tokenization
+        if _ENI_AVAILABLE and _eni_enabled():
+            messages_for_generation = _eni_enrich(
+                [dict(m) if hasattr(m, "model_dump") else dict(m) for m in messages_for_generation],
+                session_id=resolved_session_id,
+            )
+            template_observability["eni_memory_hash"] = _eni_hash()
         prompt_ids = _encode_messages(
             state.runtime.tokenizer,
             messages_for_generation,
@@ -32989,6 +33098,37 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["request_session_bank_bypass"] = (
             session_bank_for_generation is None
         )
+        # ENI Phase A (T1): KV Pre-Computation
+        # Pre-inject cached KV snapshot before MTPLX calls restore_or_prefill_prompt_state().
+        # On cache-miss, wrap the bank with _ENIKVCaptureBankProxy so the first put()
+        # transparently fires capture_kv_async on a background thread.
+        _eni_kv_injected = False
+        if _ENI_KV_AVAILABLE and _ENI_AVAILABLE and _eni_enabled() and session_bank_for_generation is not None:
+            _eni_current_hash = _eni_hash()
+            if _eni_current_hash and _eni_current_hash != "empty":
+                _eni_kv_injected = _eni_maybe_inject_kv(
+                    session_bank_for_generation,
+                    prompt_ids,
+                    _eni_current_hash,
+                    state.runtime,
+                )
+                request_observability["eni_kv_cache_hit"] = _eni_kv_injected
+                if not _eni_kv_injected:
+                    # Wrap bank so first put() fires async capture
+                    session_bank_for_generation = _ENIKVCaptureBankProxy(
+                        session_bank_for_generation,
+                        _eni_current_hash,
+                        state.runtime,
+                    )
+        # ENI Phase C (T8): Memory-fused Metal kernel integration.
+        # Full pipeline: retrieve → project → register for kernel.
+        if _ENI_MF_AVAILABLE and _ENI_AVAILABLE and _eni_enabled():
+            try:
+                _eni_mf_clear()  # Clear any stale registry first
+                # Prepare memories for Metal kernel (retrieval + projection + registration)
+                _eni_prepare_mem_kernel(messages)
+            except Exception as e:
+                _log.debug(f"[ENI Kernel] Preparation failed: {e}")
         commit_prompt_prefix = _commit_prompt_prefix_for_request(
             state,
             prompt_ids=prompt_ids,
@@ -36663,6 +36803,24 @@ def create_app(state: ServerState) -> FastAPI:
         )
         try:
             generated = await asyncio.to_thread(run_nonstream_generation)
+            # ENI Phase B (T7): Record pos-1 accept rate for cross-request EMA.
+            # Fire-and-forget — _eni_as_record() spawns a background thread
+            # so this adds ~0µs to the hot path. Only fires when generation
+            # succeeded (inside try, before except) and draft was active.
+            if _ENI_AS_AVAILABLE and _ENI_AVAILABLE and _eni_enabled() and effective_draft_sampler is not None:
+                _eni_ar = _eni_as_extract_rate(generated)
+                if _eni_ar is not None:
+                    _eni_as_record(
+                        _eni_hash(),
+                        _eni_ar,
+                        float(getattr(effective_draft_sampler, "temperature", 0.0)),
+                    )
+            # ENI Phase C (T8): Clear per-request memory KV registry after generation.
+            if _ENI_MF_AVAILABLE and _ENI_AVAILABLE and _eni_enabled():
+                try:
+                    _eni_mf_clear()
+                except Exception:
+                    pass
         except EngineSessionBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except _StopSequenceHit:

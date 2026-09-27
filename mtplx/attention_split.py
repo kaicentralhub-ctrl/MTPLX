@@ -525,13 +525,45 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     scale=self.scale,
                 )
             else:
-                output = sdpa_gqa_packed_tail(
-                    queries=queries,
-                    keys=cache.keys,
-                    values=cache.values,
-                    offset=cache.offset,
-                    scale=self.scale,
-                )
+                # ENI Phase C (T8): Memory-fused q=1 decode path.
+                # For q_len==1 and an active memory KV registry entry for this
+                # layer, try sdpa_mem_fused_q1 before sdpa_gqa_packed_tail.
+                # On any bail (None return) we fall through to packed as usual.
+                _eni_mf_output = None
+                _eni_mf_layer = int(getattr(self, "_mtplx_full_attention_index", -1))
+                if int(queries.shape[2]) == 1 and _eni_mf_layer >= 0:
+                    try:
+                        from mtplx.eni.sdpa_mem_fused import (
+                            sdpa_mem_fused_q1 as _eni_sdpa_mem_fused_q1,
+                            get_mem_kv_for_layer as _eni_get_mem_kv,
+                        )
+                        _eni_mem_kv = _eni_get_mem_kv(_eni_mf_layer)
+                        if _eni_mem_kv is not None:
+                            # Unpack 3-tuple: (keys, values, importance_weights)
+                            _eni_mk, _eni_mv = _eni_mem_kv[:2]
+                            _eni_imp = _eni_mem_kv[2] if len(_eni_mem_kv) > 2 else None
+                            _eni_mf_output = _eni_sdpa_mem_fused_q1(
+                                queries=queries,
+                                keys=cache.keys,
+                                values=cache.values,
+                                offset=cache.offset,
+                                mem_keys=_eni_mk,
+                                mem_values=_eni_mv,
+                                scale=self.scale,
+                                importance_weights=_eni_imp,
+                            )
+                    except Exception:
+                        _eni_mf_output = None
+                if _eni_mf_output is not None:
+                    output = _eni_mf_output
+                else:
+                    output = sdpa_gqa_packed_tail(
+                        queries=queries,
+                        keys=cache.keys,
+                        values=cache.values,
+                        offset=cache.offset,
+                        scale=self.scale,
+                    )
             if output is not None:
                 self._mtplx_gqa_packed_sdpa_calls = (
                     int(getattr(self, "_mtplx_gqa_packed_sdpa_calls", 0)) + 1
